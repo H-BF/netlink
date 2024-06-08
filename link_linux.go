@@ -2399,26 +2399,23 @@ func LinkSubscribeWithOptions(ch chan<- LinkUpdate, done <-chan struct{}, option
 
 func linkSubscribeAt(newNs, curNs netns.NsHandle, ch chan<- LinkUpdate, done <-chan struct{}, cberr func(error), listExisting bool,
 	rcvbuf int, rcvTimeout *unix.Timeval, rcvbufForce bool) error {
+
 	s, err := nl.SubscribeAt(newNs, curNs, unix.NETLINK_ROUTE, unix.RTNLGRP_LINK)
 	if err != nil {
 		return err
 	}
 	if rcvTimeout != nil {
 		if err := s.SetReceiveTimeout(rcvTimeout); err != nil {
+			s.Close()
 			return err
 		}
 	}
 	if rcvbuf != 0 {
 		err = s.SetReceiveBufferSize(rcvbuf, rcvbufForce)
 		if err != nil {
+			s.Close()
 			return err
 		}
-	}
-	if done != nil {
-		go func() {
-			<-done
-			s.Close()
-		}()
 	}
 	if listExisting {
 		req := pkgHandle.newNetlinkRequest(unix.RTM_GETLINK,
@@ -2426,24 +2423,57 @@ func linkSubscribeAt(newNs, curNs netns.NsHandle, ch chan<- LinkUpdate, done <-c
 		msg := nl.NewIfInfomsg(unix.AF_UNSPEC)
 		req.AddData(msg)
 		if err := s.Send(req); err != nil {
+			s.Close()
 			return err
 		}
 	}
+	stopped := make(chan struct{})
 	go func() {
+		select {
+		case <-done:
+		case <-stopped:
+		}
+		s.Close()
+	}()
+	go func() {
+		defer close(stopped)
 		defer close(ch)
+		errIf := func(e error) bool {
+			if e == nil {
+				return false
+			}
+			if cberr != nil {
+				if done == nil {
+					cberr(e)
+				} else {
+					select {
+					case <-done:
+					default:
+						cberr(e)
+					}
+				}
+			}
+			return true
+		}
+		send := func(m LinkUpdate) bool {
+			if done == nil {
+				ch <- m
+			} else {
+				select {
+				case <-done:
+					return false
+				case ch <- m:
+				}
+			}
+			return true
+		}
 		for {
 			msgs, from, err := s.Receive()
-			if err != nil {
-				if cberr != nil {
-					cberr(fmt.Errorf("Receive failed: %v",
-						err))
-				}
+			if errIf(err) {
 				return
 			}
 			if from.Pid != nl.PidKernel {
-				if cberr != nil {
-					cberr(fmt.Errorf("Wrong sender portid %d, expected %d", from.Pid, nl.PidKernel))
-				}
+				_ = errIf(fmt.Errorf("wrong sender portid %d, expected %d", from.Pid, nl.PidKernel))
 				continue
 			}
 			for _, m := range msgs {
@@ -2451,30 +2481,24 @@ func linkSubscribeAt(newNs, curNs netns.NsHandle, ch chan<- LinkUpdate, done <-c
 					continue
 				}
 				if m.Header.Type == unix.NLMSG_ERROR {
-					error := int32(native.Uint32(m.Data[0:4]))
-					if error == 0 {
-						continue
-					}
-					if cberr != nil {
-						cberr(fmt.Errorf("error message: %v",
-							syscall.Errno(-error)))
+					ern := int32(native.Uint32(m.Data[0:4]))
+					if ern != 0 {
+						_ = errIf(syscall.Errno(-ern))
 					}
 					continue
 				}
 				ifmsg := nl.DeserializeIfInfomsg(m.Data)
 				header := unix.NlMsghdr(m.Header)
 				link, err := LinkDeserialize(&header, m.Data)
-				if err != nil {
-					if cberr != nil {
-						cberr(err)
-					}
+				if errIf(err) {
 					continue
 				}
-				ch <- LinkUpdate{IfInfomsg: *ifmsg, Header: header, Link: link}
+				if !send(LinkUpdate{IfInfomsg: *ifmsg, Header: header, Link: link}) {
+					return
+				}
 			}
 		}
 	}()
-
 	return nil
 }
 
